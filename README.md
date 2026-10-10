@@ -2,87 +2,114 @@
 
 Batch-remove the JuiceBox logo from hundreds of PDF resumes in one click.
 
-- Tested on real JuiceBox exports: logo fully gone, all text intact, divider lines and icons untouched.
-- Originals are never modified by the cleaner — cleaned copies go to `<your-folder>/cleaned/` plus a `report.txt`.
-- Fully offline. No uploads, no subscriptions.
-- What it removes: vector-drawn header logo (top 15% centered cluster), text wordmarks in the header, repeated image logos, watermark annotations.
+- **Fully offline.** No uploads, no accounts, no subscriptions.
+- **Originals are never modified.** Cleaned copies go to `<your-folder>/cleaned/`, plus a `report.txt`.
+- **It will not silently damage a resume.** Every cleaned copy is compared with its original. If anything other than the word "Juicebox" went missing, the copy is discarded and the untouched original is copied instead (reported as `REVERTED`).
+- **One bad PDF never stops the batch** — it is listed as `SKIPPED` in the report.
+- Optionally moves originals that had a logo to the Trash / Recycle Bin (recoverable) — only after the cleaned copy has been verified.
 
-Built from: `app.py` (desktop GUI) + `remove_logos.py` (cleaning engine).
+## What it removes
+
+| Target | How it is recognised |
+|---|---|
+| Vector-drawn header logo (the real JuiceBox export) | small, centered cluster of vector shapes in the top 15% of **page 1**; never touches full-width dividers, and never touches anything that has text on it |
+| Text wordmark "Juicebox" | the word in the header band (top 30%, roughly centered) plus the icon next to it |
+| Repeated image logo | the same small image at the same spot on most pages |
+| Watermark annotations | `/Watermark` annotations |
+
+Header photos, contact icons, name banners and body content are left alone.
+Pages with a rotation (`/Rotate`) are not scanned for header logos.
 
 ---
 
 ## For end users (no experience needed)
 
-You will receive either `LogoRemover-windows.zip` (Windows) or `LogoRemover.dmg` (Mac). Pick your section below.
+You will receive `LogoRemover-windows.zip` (Windows) or a `.dmg` (Mac).
 
 ### Windows
 
 1. Unzip `LogoRemover-windows.zip` (right-click → Extract All).
-2. Open the unzipped folder, double-click `LogoRemover.exe`.
-3. **First-run warning (one time only, because the app is unsigned):**
-   - Windows SmartScreen says "Windows protected your PC".
-   - Click **More info** → **Run anyway**.
-   - After that it opens like a normal app.
-4. In the app:
-   - Click **Choose folder…** and pick the folder with your PDF resumes.
-   - (Recommended: leave ☑ "Delete originals that had logos" ON — it moves originals to the Recycle Bin, so you can undo.)
-   - Click **Clean PDFs**. Watch the progress bar: "Cleaning 45 of 200…"
-   - When done, click **Open cleaned files** to see the cleaned copies.
-5. Done. Cleaned PDFs are in `<your-folder>/cleaned/`. If you left the checkbox on, originals that had logos are in the Recycle Bin (recoverable).
+2. Open the folder and double-click `LogoRemover.exe`.
+3. **First run only** (the app is unsigned): if Windows says *"Windows protected your PC"*, click **More info** → **Run anyway**.
 
-### macOS
+### Mac
 
-1. Double-click `LogoRemover.dmg` to open it.
-2. Drag `LogoRemover.app` into Applications (or double-click it right from the DMG to try it).
-3. **First-run warning (one time only, because the app is unsigned):**
-   - Right-click (or Control-click) `LogoRemover.app` → **Open** → **Open** in the dialog.
-   - After that it opens like a normal app.
-4. In the app:
-   - Click **Choose folder…** and pick the folder with your PDF resumes.
-   - (Recommended: leave ☑ "Delete originals that had logos" ON — it moves originals to Trash, so you can undo.)
-   - Click **Clean PDFs**. Watch the progress bar.
-   - When done, click **Open cleaned files**.
-5. Done. Cleaned PDFs are in `<your-folder>/cleaned/`. Originals that had logos are in Trash (recoverable).
+There are two Mac builds — use the one that matches your Mac (Apple menu → **About This Mac**):
 
-> If the checkbox is OFF, originals are left alone and you get both copies.
+- **`LogoRemover-apple-silicon.dmg`** — Macs with an M1, M2, M3, M4… chip
+- **`LogoRemover-intel.dmg`** — Macs with an Intel processor
+
+1. Double-click the `.dmg` and drag **LogoRemover** into **Applications**.
+2. **First run only** (the app is unsigned):
+   - **macOS 15 (Sequoia) or newer:** double-click LogoRemover. When macOS blocks it, click **Done/Cancel**, open **System Settings → Privacy & Security**, scroll down to *Security*, click **Open Anyway** next to LogoRemover, then confirm.
+   - **macOS 14 or older:** right-click (or Control-click) LogoRemover → **Open** → **Open**.
+   - If macOS says the app is *"damaged"*, open Terminal and run:
+     `xattr -dr com.apple.quarantine /Applications/LogoRemover.app`
+
+### Using the app (both systems)
+
+1. Click **Choose folder…** and pick the folder with the PDF resumes.
+2. Leave **"Move originals that had a logo to Trash"** ticked if you want the originals out of the way (recoverable), or untick it to keep both copies.
+3. Click **Clean PDFs**, then **Open cleaned files**.
+
+Cleaned PDFs are in `<your-folder>/cleaned/`. Only the PDFs directly inside the chosen folder are processed (not sub-folders).
 
 ---
 
-## For the maintainer (you)
+## For the maintainer
 
-### What to upload to GitHub
+### Files to upload to the repo
 
-Create a **public** repo named `logo-remover` and upload these 5 files/folders (keep the folder structure):
+Replace/add these, keeping the folder structure:
 
-- `app.py`
-- `remove_logos.py`
-- `requirements.txt`
-- `logo-remover.spec`
-- `.github/workflows/build.yml` (must stay in `.github/workflows/`)
-- `README.md` (optional but recommended)
+```
+app.py
+remove_logos.py
+requirements.txt
+logo-remover.spec
+README.md
+.gitignore
+tests/test_engine.py
+.github/workflows/build.yml
+```
 
-### Build via GitHub Actions (free, no build machine needed)
+### Builds (GitHub Actions — free, no build machine needed)
 
-1. Push the files to `main` (upload via the GitHub website is fine).
-2. Go to the **Actions** tab in your repo → click the latest "Build LogoRemover" run.
-3. Wait ~10 minutes for both jobs (Windows + macOS) to turn green.
-4. Scroll to **Artifacts** at the bottom of the run:
-   - Download `LogoRemover-windows` → contains `LogoRemover-windows.zip`
-   - Download `LogoRemover-mac` → contains `LogoRemover.dmg`
-5. Send those two files to the end user with the warning-bypass steps above.
+Every push to `main` (and every pull request) runs `.github/workflows/build.yml`:
 
-To rebuild after a change: just upload the changed file(s) again — Actions rebuilds automatically.
+1. **Unit tests** (Linux, then again on Windows and macOS).
+2. **PyInstaller build** for Windows, macOS Apple Silicon and macOS Intel.
+3. **Self-test of the built app** — the freshly built `.exe` / `.app` is launched with `--selftest`, which runs the cleaning engine on generated PDFs, checks `send2trash` and opens a Tk window. If the packaged app is broken, the job fails and **no artifact is published**.
+4. The macOS app is ad-hoc signed (required for Apple Silicon) and packed into a drag-to-Applications `.dmg`.
 
-### CLI usage (optional, for testing)
+Download from **Actions → latest "Build LogoRemover" run → Artifacts**:
+
+- `LogoRemover-windows` → `LogoRemover-windows.zip`
+- `LogoRemover-mac-apple-silicon` → `LogoRemover-apple-silicon.dmg`
+- `LogoRemover-mac-intel` → `LogoRemover-intel.dmg`
+
+> The Intel Mac job uses the `macos-15-intel` runner, which GitHub has announced it will retire in Fall 2027. If you no longer need Intel Macs, delete that entry from the `matrix` in `build.yml`.
+
+### Command line / development
 
 ```bash
 pip install -r requirements.txt
-python3 remove_logos.py /path/to/resumes
-# optional: python3 remove_logos.py /path/to/resumes --out /path/to/out
+python3 remove_logos.py /path/to/resumes            # -> /path/to/resumes/cleaned/
+python3 remove_logos.py /path/to/resumes --out /somewhere/else
+python3 remove_logos.py --selftest                  # built-in engine check
+python3 -m unittest discover -s tests -v            # unit tests (synthetic PDFs only)
+python3 app.py                                      # run the GUI
 ```
 
-Cleaned copies land in `<input>/cleaned/` plus `report.txt`.
+Tuning knobs (top of `remove_logos.py`): `WORD`, `HEADER_PAGES`, `VECTOR_BAND`, `VECTOR_MAX_W/H`, `WORDMARK_BAND`, `REPEAT_SHARE`, `IMAGE_MAX_AREA`.
+To keep originals by default, change `self.delete_originals = tk.BooleanVar(value=True)` to `value=False` in `app.py`.
 
-### Privacy note
+### Notes
+
+- Requirements are just `pymupdf` and `send2trash` (the old `pypdf` dependency is gone).
+- Password-protected PDFs are skipped. PDFs with only an owner password (printing restrictions) are cleaned, and the cleaned copy has that encryption removed.
+- Don't commit real resumes to the repo — the tests generate their own synthetic PDFs.
+
+### Privacy
 
 The cleaner runs 100% locally. Resumes are never uploaded anywhere.

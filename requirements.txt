@@ -1,3 +1,2 @@
-pypdf
-pymupdf
-send2trash
+pymupdf>=1.24.3
+send2trash>=1.8.0

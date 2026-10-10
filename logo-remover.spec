@@ -1,36 +1,36 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec for LogoRemover desktop app.
+PyInstaller spec for the LogoRemover desktop app.
 
-- Windowed (no console)
-- One-dir build (COLLECT), app name LogoRemover
-- macOS: native arch (Apple Silicon on macos-latest runners)
-- Entry point: app.py (which imports remove_logos.py engine)
+- Windowed (no console), one-dir build, app name LogoRemover
+- macOS: builds for the architecture of the machine running it
+  (Apple Silicon on macos-latest, Intel on macos-15-intel)
+- Entry point: app.py (imports the remove_logos.py engine)
 
 Build locally:
     pip install -r requirements.txt pyinstaller
-    pyinstaller logo-remover.spec
+    pyinstaller --noconfirm logo-remover.spec
 """
+from PyInstaller.utils.hooks import collect_submodules
 
-block_cipher = None
+# send2trash picks its platform backend (Windows / macOS / Linux) at import
+# time; collect all backends so the frozen app can always move files to Trash.
+hiddenimports = collect_submodules('send2trash')
 
 a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
@@ -41,11 +41,11 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    console=False,  # windowed: no console window
+    upx=False,          # UPX-packed exes trigger more antivirus false positives
+    console=False,      # windowed: no console window
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch=None,  # native arch (universal2 needs a universal2 Python build; None = what the runner has)
+    target_arch=None,   # native arch of the build machine
     codesign_identity=None,
     entitlements_file=None,
 )
@@ -53,18 +53,21 @@ exe = EXE(
 coll = COLLECT(
     exe,
     a.binaries,
-    a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
-    upx_exclude=[],
+    upx=False,
     name='LogoRemover',
 )
 
-# macOS .app bundle (only used on macOS builds; harmless on Windows)
+# macOS .app bundle (only used on macOS builds; ignored on Windows/Linux)
 app = BUNDLE(
     coll,
     name='LogoRemover.app',
     icon=None,
     bundle_identifier='com.logoremover.app',
+    info_plist={
+        'CFBundleName': 'LogoRemover',
+        'CFBundleDisplayName': 'LogoRemover',
+        'NSHighResolutionCapable': True,
+    },
 )

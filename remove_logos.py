@@ -1,530 +1,353 @@
 #!/usr/bin/env python3
-"""Batch-remove logos and watermarks from PDFs (built for resume batches).
+"""Batch-remove the Juicebox logo (and watermarks) from PDF resumes.
 
-What it removes, per file:
-  1. /Watermark annotations (e.g. DRAFT / agency stamps).
-  2. Image XObjects that repeat on most pages at a consistent position with a
-     small footprint (typical agency header/footer logo), including logos
-     nested inside Form XObjects.
-  3. On single-page PDFs, small images sitting in the top/bottom margin band
-     (likely header/footer logos) -- body photos are kept.
-  4. Text wordmarks (e.g. the "Juicebox" header on JuiceBox exports): the
-     wordmark text plus its adjacent icon are whited out, but ONLY when found
-     in the top header band and roughly centered -- body text mentioning the
-     word (e.g. work experience) is never touched.
-  5. Vector-drawn logos: the real JuiceBox export draws its logo as vector
-     paths (not text, not an image). Small, centered clusters of vector
-     drawings in the top 15% of the page are detected and whited out;
-     full-width rules/dividers are kept.
+Engine used by both the desktop app (app.py) and the command line.
+Only depends on PyMuPDF (pip install -r requirements.txt). Python 3.9+,
+Windows / macOS / Linux.
 
-Requires: pypdf, pymupdf  (pip install -r requirements.txt)
-Works on macOS and Windows with Python 3.9+.
+What it removes, per file
+-------------------------
+1. Vector-drawn header logo: the real Juicebox export draws its logo as vector
+   paths (not text, not an image). A small, centered cluster of vector
+   drawings in the top 15% of the FIRST page is whited out.
+     * full-width rules / dividers are kept
+     * a cluster that overlaps ANY text is never touched (protects name
+       banners and similar designs)
+2. Text wordmark: the word "Juicebox" in the header band (top 30%, roughly
+   centered), plus an icon right next to it.
+3. Repeated image logos: an image that appears at the same spot on most pages
+   and is small (agency header/footer logo).
+4. /Watermark annotations.
 
-Originals are NEVER modified. Cleaned copies go to <input_dir>/cleaned/ and a
-report is printed + saved as <input_dir>/cleaned/report.txt.
+Safety guarantees
+-----------------
+* Original files are NEVER modified, and nothing is written next to them.
+  Cleaned copies go to <input_dir>/cleaned/ (plus report.txt).
+* After cleaning, the copy is compared with the original. If any text other
+  than the word "Juicebox" went missing, the cleaned copy is discarded and
+  the untouched original is copied instead (reported as REVERTED).
+* One bad PDF never stops the batch; it is reported as SKIPPED.
 
-Usage:
+Usage
+-----
     python3 remove_logos.py /path/to/resumes [--out /path/to/out]
+    python3 remove_logos.py --selftest
 """
 
 import argparse
-import hashlib
-import io
 import math
 import os
+import shutil
 import sys
-from collections import defaultdict
+import tempfile
+from collections import Counter, defaultdict
 
-from pypdf import PdfReader, PdfWriter
-from pypdf.generic import (
-    ArrayObject,
-    ContentStream,
-    DecodedStreamObject,
-    IndirectObject,
-    NameObject,
-)
-
-IMAGE_OP = b"Do"
-CM_OP = b"cm"
-PUSH_OP = b"q"
-POP_OP = b"Q"
-
-IDENTITY = [1, 0, 0, 1, 0, 0]
-
-
-def norm_name(n):
-    s = str(n)
-    return s[1:] if s.startswith("/") else s
-
-
-def mat_mult(m1, m2):
-    a1, b1, c1, d1, e1, f1 = m1
-    a2, b2, c2, d2, e2, f2 = m2
-    return [
-        a1 * a2 + b1 * c2,
-        a1 * b2 + b1 * d2,
-        c1 * a2 + d1 * c2,
-        c1 * b2 + d1 * d2,
-        e1 * a2 + f1 * c2 + e2,
-        e1 * b2 + f1 * d2 + f2,
-    ]
-
-
-def apply_mat(m, x, y):
-    a, b, c, d, e, f = m
-    return (a * x + c * y + e, b * x + d * y + f)
-
-
-def unit_square_bbox(ctm):
-    pts = [apply_mat(ctm, x, y) for x, y in ((0, 0), (1, 0), (0, 1), (1, 1))]
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-    return (min(xs), min(ys), max(xs), max(ys))
-
-
-def obj_to_pdf(o):
-    if isinstance(o, IndirectObject):
-        return f"{o.idnum} {o.generation} R"
-    buf = io.BytesIO()
-    o.write_to_stream(buf)
-    return buf.getvalue().decode("latin-1")
-
-
-def serialize_ops(ops):
-    parts = []
-    for operands, operator in ops:
-        op = operator.decode("latin-1") if isinstance(operator, bytes) else str(operator)
-        parts.append(" ".join(obj_to_pdf(o) for o in operands) + " " + op)
-    return ("\n".join(parts) + "\n").encode("latin-1")
-
-
-def page_size(page):
-    mb = page.mediabox
-    return float(mb.width), float(mb.height)
-
-
-def image_name_to_hash(page):
-    """Map normalized XObject name -> md5 of decoded image bytes."""
-    mapping = {}
-    try:
-        for img in page.images:
-            name = getattr(img, "name", None)
-            data = getattr(img, "data", None)
-            if name and data:
-                h = hashlib.md5(data).hexdigest()
-                n = norm_name(name)
-                mapping[n] = h
-                # pypdf synthesizes names with an image extension appended
-                # (e.g. /Im0 -> 'Im0.png'); also index the extensionless form
-                for ext in (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".jp2"):
-                    if n.lower().endswith(ext):
-                        mapping[n[: -len(ext)]] = h
-                        break
-    except Exception:
-        pass
-    return mapping
-
-
-def resolve_xobject(name, resources, reader):
-    try:
-        xobjs = resources.get("/XObject")
-        if xobjs is None:
-            return None
-        ref = xobjs.get(name if str(name).startswith("/") else "/" + str(name))
-        return ref.get_object() if ref is not None else None
-    except Exception:
-        return None
-
-
-def collect_placements(content_stream_obj, reader, resources, name_to_hash, ctm, out):
-    """Walk a content stream, recording (image_hash, page-space bbox)."""
-    try:
-        ops = ContentStream(content_stream_obj, reader).operations
-    except Exception:
-        return
-    stack = []
-    cur = list(ctm)
-    for operands, operator in ops:
-        if operator == PUSH_OP:
-            stack.append(list(cur))
-        elif operator == POP_OP:
-            if stack:
-                cur = stack.pop()
-        elif operator == CM_OP:
-            try:
-                cur = mat_mult([float(x) for x in operands], cur)
-            except Exception:
-                pass
-        elif operator == IMAGE_OP:
-            if not operands:
-                continue
-            name = str(operands[0])
-            xo = resolve_xobject(name, resources, reader)
-            if xo is None:
-                continue
-            if xo.get("/Subtype") == "/Image":
-                h = name_to_hash.get(norm_name(name))
-                if h:
-                    out.append({"hash": h, "bbox": unit_square_bbox(cur)})
-            elif xo.get("/Subtype") == "/Form":
-                matrix = xo.get("/Matrix")
-                sub_ctm = list(cur)
-                if matrix is not None:
-                    try:
-                        sub_ctm = mat_mult([float(x) for x in matrix], cur)
-                    except Exception:
-                        pass
-                sub_res = xo.get("/Resources") or resources
-                collect_placements(xo, reader, sub_res, name_to_hash, sub_ctm, out)
-
-
-def remove_watermark_annots(page):
-    annots = page.get("/Annots")
-    if not annots:
-        return 0
-    removed = 0
-    kept = ArrayObject()
-    for ref in annots:
-        try:
-            obj = ref.get_object()
-        except Exception:
-            kept.append(ref)
-            continue
-        if obj.get("/Subtype") == "/Watermark":
-            removed += 1
-        else:
-            kept.append(ref)
-    if removed:
-        if kept:
-            page[NameObject("/Annots")] = kept
-        elif "/Annots" in page:
-            del page["/Annots"]
-    return removed
-
-
-def strip_ops(stream_obj, reader, drop_names):
-    """Return serialized bytes of stream with logo Do ops removed, or None."""
-    try:
-        ops = ContentStream(stream_obj, reader).operations
-    except Exception:
-        return None
-    new_ops = []
-    changed = False
-    for operands, operator in ops:
-        if (
-            operator == IMAGE_OP
-            and operands
-            and norm_name(operands[0]) in drop_names
-        ):
-            changed = True
-            continue
-        new_ops.append((operands, operator))
-    return serialize_ops(new_ops) if changed else None
-
-
-def replace_stream_data(stream_obj, new_data):
-    """New filter-free DecodedStreamObject carrying new_data + copied dict entries."""
-    ns = DecodedStreamObject()
-    for k, v in stream_obj.items():
-        if k in ("/Filter", "/Length"):
-            continue
-        ns[NameObject(k)] = v
-    ns._data = new_data
-    return ns
-
-
-def content_streams(page):
-    contents = page.get("/Contents")
-    if contents is None:
-        return []
-    if isinstance(contents, ArrayObject):
-        return [s.get_object() for s in contents]
-    return [contents.get_object()]
-
-
-def _wordmark_hits_on_page(page, word):
-    """Rects of wordmark text hits in the top header band (centered only)."""
-    r = page.rect
-    top_edge = r.y0 + r.height * 0.30
-    seen = set()
-    hits = []
-    for variant in (word, word.capitalize(), word.upper()):
-        for h in page.search_for(variant):
-            key = (round(h.x0, 1), round(h.y0, 1),
-                   round(h.x1, 1), round(h.y1, 1))
-            if key in seen:
-                continue
-            seen.add(key)
-            cx = (h.x0 + h.x1) / 2
-            if h.y1 <= top_edge and r.width * 0.25 <= cx <= r.width * 0.75:
-                hits.append(h)
-    return hits
-
-
-def _redact_rect_for_wordmark(page, h):
-    """Expand a wordmark text hit to cover its adjacent icon (vector/image)."""
+try:
     import pymupdf
-    pad_v = h.height * 0.45
-    # expand left extra: the cube icon sits left of the wordmark
-    rect = pymupdf.Rect(h.x0 - h.height * 1.8, h.y0 - pad_v,
-                        h.x1 + h.height * 0.6, h.y1 + pad_v)
-    for d in page.get_drawings():
-        dr = d["rect"]
-        if (abs(dr.y0 - h.y0) < h.height * 1.5
-                and dr.x1 <= h.x0 + 2
-                and dr.x0 >= h.x0 - h.height * 3.5):
-            rect |= dr
-    for img in page.get_images(full=True):
-        try:
-            ib = page.get_image_bbox(img)
-        except Exception:
-            continue
-        if (abs(ib.y0 - h.y0) < h.height * 1.5
-                and ib.x1 <= h.x0 + 2
-                and ib.x0 >= h.x0 - h.height * 3.5):
-            rect |= ib
-    return rect
+except ImportError:  # PyMuPDF < 1.24.3 only ships the legacy name
+    import fitz as pymupdf
+
+__version__ = "2.0.0"
+
+try:  # keep MuPDF's console chatter out of the way (windowed apps, CI logs)
+    pymupdf.TOOLS.mupdf_display_errors(False)
+except Exception:
+    pass
+
+# ---------------------------------------------------------------- settings --
+WORD = "juicebox"          # text wordmark to look for
+HEADER_PAGES = 1           # vector/wordmark detection only on the first N pages
+VECTOR_BAND = 0.15         # top fraction of the page searched for vector logos
+VECTOR_MAX_W = 0.35        # logo cluster must be narrower than this * page width
+VECTOR_MAX_H = 0.06        # ...and shorter than this * page height
+WORDMARK_BAND = 0.30       # top fraction searched for the text wordmark
+REPEAT_SHARE = 0.70        # image must be on >= this share of pages
+IMAGE_MAX_AREA = 0.12      # repeated-image logo must cover < this * page area
+
+_WHITE = (1, 1, 1)
 
 
-def _vector_logo_rects_on_page(page):
-    """Find vector-drawn logos (e.g. the JuiceBox header mark) in the top band.
+# ---------------------------------------------------------------- helpers ---
+def _text_words(page):
+    return [pymupdf.Rect(w[:4]) for w in page.get_text("words")]
 
-    The JuiceBox logo is not text and not an image -- it is drawn as vector
-    paths. We find it as a cluster of small, roughly centered vector drawings
-    in the top 15% of the page. Full-width rules/dividers are excluded, as are
-    tall graphics. Returns a list of rects to redact."""
-    import pymupdf
+
+def _overlaps(rect, others):
+    for o in others:
+        inter = rect & o
+        if not inter.is_empty:
+            return True
+    return False
+
+
+def _redact(page, rects, images, graphics, text):
+    """Apply white redactions for rects with explicit removal modes."""
+    for r in rects:
+        page.add_redact_annot(r, fill=_WHITE)
+    page.apply_redactions(images=images, graphics=graphics, text=text)
+
+
+# ------------------------------------------------------- 1. vector logo -----
+def _vector_logo_rects(page):
     r = page.rect
     W, H = r.width, r.height
-    band_y = r.y0 + H * 0.15
+    band_y = r.y0 + H * VECTOR_BAND
+
     cands = []
     for d in page.get_drawings():
         q = d["rect"]
         if q.y1 > band_y:
             continue
-        if (q.x1 - q.x0) >= 0.5 * W:   # rules/dividers span the width; keep
+        if (q.x1 - q.x0) >= 0.5 * W:      # rules / dividers span the width
             continue
-        if (q.y1 - q.y0) > 0.08 * H:   # too tall to be a compact logo
+        if (q.y1 - q.y0) > 0.08 * H:      # too tall to be a compact logo
             continue
         cands.append(q)
-    # cluster nearby drawings (the logo's letters/icon are separate paths)
+
+    # cluster nearby drawings (letters / icon are separate paths)
     clusters = []
     for q in sorted(cands, key=lambda q: q.x0):
-        placed = False
         for cl in clusters:
-            if not (q.x1 < cl["x0"] - 12 or q.x0 > cl["x1"] + 12 or
-                    q.y1 < cl["y0"] - 12 or q.y0 > cl["y1"] + 12):
-                cl["x0"] = min(cl["x0"], q.x0)
-                cl["y0"] = min(cl["y0"], q.y0)
-                cl["x1"] = max(cl["x1"], q.x1)
-                cl["y1"] = max(cl["y1"], q.y1)
-                placed = True
+            if not (q.x1 < cl[0] - 12 or q.x0 > cl[2] + 12 or
+                    q.y1 < cl[1] - 12 or q.y0 > cl[3] + 12):
+                cl[0] = min(cl[0], q.x0)
+                cl[1] = min(cl[1], q.y0)
+                cl[2] = max(cl[2], q.x1)
+                cl[3] = max(cl[3], q.y1)
                 break
-        if not placed:
-            clusters.append({"x0": q.x0, "y0": q.y0, "x1": q.x1, "y1": q.y1})
+        else:
+            clusters.append([q.x0, q.y0, q.x1, q.y1])
+
+    words = _text_words(page)
     rects = []
-    for cl in clusters:
-        cx = (cl["x0"] + cl["x1"]) / 2
-        if (cl["x1"] - cl["x0"]) < 0.5 * W and W * 0.30 <= cx <= W * 0.70:
-            rects.append(pymupdf.Rect(cl["x0"] - 4, cl["y0"] - 4,
-                                      cl["x1"] + 4, cl["y1"] + 4))
+    for x0, y0, x1, y1 in clusters:
+        cx = (x0 + x1) / 2
+        if (x1 - x0) >= VECTOR_MAX_W * W or (y1 - y0) > VECTOR_MAX_H * H:
+            continue
+        if not (W * 0.30 <= cx <= W * 0.70):
+            continue
+        rect = pymupdf.Rect(x0 - 4, y0 - 4, x1 + 4, y1 + 4)
+        if _overlaps(rect, words):         # never touch anything with text on it
+            continue
+        rects.append(rect)
     return rects
 
 
-def fitz_prepass(src_path, word="juicebox"):
-    """Single PyMuPDF pre-pass over the header: vector-drawn logos plus text
-    wordmarks (+ adjacent icons). Body content is never touched.
+# ------------------------------------------------------ 2. text wordmark ----
+def _wordmark_hits(page, word):
+    r = page.rect
+    top_edge = r.y0 + r.height * WORDMARK_BAND
+    seen, hits = set(), []
+    for h in page.search_for(word):      # PyMuPDF search is case-insensitive
+        key = (round(h.x0, 1), round(h.y0, 1), round(h.x1, 1), round(h.y1, 1))
+        if key in seen:
+            continue
+        seen.add(key)
+        cx = (h.x0 + h.x1) / 2
+        if h.y1 <= top_edge and r.width * 0.25 <= cx <= r.width * 0.75:
+            hits.append(h)
+    return hits
 
-    Returns (temp_path or None, {"vector_logos": n, "wordmarks": m}).
-    temp_path is a cleaned copy when anything was removed, else None.
-    Never raises."""
-    empty = {"vector_logos": 0, "wordmarks": 0}
-    try:
-        import pymupdf
-    except Exception:
-        return None, empty
-    try:
-        doc = pymupdf.open(src_path)
-    except Exception:
-        return None, empty
-    counts = {"vector_logos": 0, "wordmarks": 0}
-    try:
-        for page in doc:
-            n_v = n_w = 0
-            for rect in _vector_logo_rects_on_page(page):
-                page.add_redact_annot(rect, fill=(1, 1, 1))
-                n_v += 1
-            for h in _wordmark_hits_on_page(page, word):
-                page.add_redact_annot(_redact_rect_for_wordmark(page, h),
-                                      fill=(1, 1, 1))
-                n_w += 1
-            if n_v or n_w:
-                page.apply_redactions()
-            counts["vector_logos"] += n_v
-            counts["wordmarks"] += n_w
-        if counts["vector_logos"] == 0 and counts["wordmarks"] == 0:
-            doc.close()
-            return None, counts
-        tmp_path = src_path + ".fitz_tmp.pdf"
-        doc.save(tmp_path, garbage=3, deflate=True)
-        doc.close()
-        return tmp_path, counts
-    except Exception:
+
+def _wordmark_rect(page, h):
+    """Expand a wordmark text hit to cover the icon sitting next to it."""
+    pad_v = h.height * 0.45
+    rect = pymupdf.Rect(h.x0 - h.height * 1.8, h.y0 - pad_v,
+                        h.x1 + h.height * 0.6, h.y1 + pad_v)
+    for d in page.get_drawings():
+        dr = d["rect"]
+        if (abs(dr.y0 - h.y0) < h.height * 1.5 and dr.x1 <= h.x0 + 2
+                and dr.x0 >= h.x0 - h.height * 3.5):
+            rect |= dr
+    for info in page.get_image_info():
+        ib = pymupdf.Rect(info["bbox"])
+        if (abs(ib.y0 - h.y0) < h.height * 1.5 and ib.x1 <= h.x0 + 2
+                and ib.x0 >= h.x0 - h.height * 3.5):
+            rect |= ib
+    return rect
+
+
+# ------------------------------------------------ 3. repeated image logos ----
+def _repeated_image_rects(doc):
+    """{page_no: [rects]} for images that repeat like an agency logo."""
+    n = doc.page_count
+    if n < 2:
+        return {}
+    placements = defaultdict(list)       # digest -> [(page_no, rect)]
+    for pno in range(n):
         try:
+            infos = doc[pno].get_image_info(hashes=True)
+        except Exception:
+            continue
+        for info in infos:
+            dg, bb = info.get("digest"), info.get("bbox")
+            if dg and bb:
+                placements[dg].append((pno, pymupdf.Rect(bb)))
+
+    out = defaultdict(list)
+    for pls in placements.values():
+        pages = {p for p, _ in pls}
+        if len(pages) < max(2, math.ceil(REPEAT_SHARE * n)):
+            continue
+        cxs = sorted((r.x0 + r.x1) / 2 for _, r in pls)
+        cys = sorted((r.y0 + r.y1) / 2 for _, r in pls)
+        mx, my = cxs[len(cxs) // 2], cys[len(cys) // 2]
+        if not all(abs((r.x0 + r.x1) / 2 - mx) < 8 and
+                   abs((r.y0 + r.y1) / 2 - my) < 8 for _, r in pls):
+            continue
+        if any(r.width * r.height >= IMAGE_MAX_AREA * doc[p].rect.width *
+               doc[p].rect.height for p, r in pls):
+            continue
+        for p, r in pls:
+            out[p].append(pymupdf.Rect(r.x0 - .5, r.y0 - .5, r.x1 + .5, r.y1 + .5))
+    return out
+
+
+# --------------------------------------------------- 4. watermark annots ----
+def _remove_watermarks(page):
+    n = 0
+    for a in list(page.annots() or []):
+        if a.type[0] == pymupdf.PDF_ANNOT_WATERMARK:
+            page.delete_annot(a)
+            n += 1
+    return n
+
+
+# ---------------------------------------------------------- verification ----
+def _word_counter(doc):
+    c = Counter()
+    for page in doc:
+        for w in page.get_text("words"):
+            c[w[4].casefold()] += 1
+    return c
+
+
+def verify_output(src, dst):
+    """(ok, reason). ok only if dst has the same page count as src and kept
+    every word of src (except the word 'Juicebox' itself)."""
+    try:
+        with pymupdf.open(src) as a, pymupdf.open(dst) as b:
+            if b.page_count == 0 or a.page_count != b.page_count:
+                return False, "page count changed"
+            lost = _word_counter(a) - _word_counter(b)
+            lost.pop(WORD, None)
+            if lost:
+                sample = ", ".join(list(lost)[:5])
+                return False, f"text would have been lost ({sample})"
+        return True, ""
+    except Exception as e:
+        return False, f"could not verify output: {e}"
+
+
+# ------------------------------------------------------------- one file ----
+def process_pdf(src, dst):
+    """Clean one PDF from src to dst. Never raises.
+
+    Returns a report dict: file, watermarks, image_logos, vector_logos,
+    wordmarks, had_logo, error, notes. When error is set nothing was written.
+    """
+    rep = {"file": os.path.basename(src), "watermarks": 0, "image_logos": 0,
+           "vector_logos": 0, "wordmarks": 0, "had_logo": False,
+           "error": None, "notes": []}
+    doc = None
+    part = dst + ".part"
+    try:
+        doc = pymupdf.open(src)
+        if doc.needs_pass and not doc.authenticate(""):
+            rep["error"] = "password-protected"
+            return rep
+        if doc.page_count == 0:
+            rep["error"] = "no pages"
+            return rep
+
+        # image logos first (needs the whole document)
+        for pno, rects in _repeated_image_rects(doc).items():
+            _redact(doc[pno], rects, pymupdf.PDF_REDACT_IMAGE_PIXELS,
+                    pymupdf.PDF_REDACT_LINE_ART_NONE, pymupdf.PDF_REDACT_TEXT_NONE)
+            rep["image_logos"] += len(rects)
+
+        for pno, page in enumerate(doc):
+            rep["watermarks"] += _remove_watermarks(page)
+
+            if page.rotation:
+                if pno < HEADER_PAGES:
+                    rep["notes"].append(f"page {pno + 1} is rotated: header scan skipped")
+                continue
+
+            if pno < HEADER_PAGES:
+                rects = _vector_logo_rects(page)
+                if rects:
+                    _redact(page, rects, pymupdf.PDF_REDACT_IMAGE_NONE,
+                            pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
+                            pymupdf.PDF_REDACT_TEXT_NONE)
+                    rep["vector_logos"] += len(rects)
+
+            hits = _wordmark_hits(page, WORD)
+            if hits:
+                rects = [_wordmark_rect(page, h) for h in hits]
+                _redact(page, rects, pymupdf.PDF_REDACT_IMAGE_PIXELS,
+                        pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
+                        pymupdf.PDF_REDACT_TEXT_REMOVE)
+                rep["wordmarks"] += len(rects)
+
+        changed = bool(rep["watermarks"] or rep["image_logos"] or
+                       rep["vector_logos"] or rep["wordmarks"])
+
+        if not changed:
             doc.close()
+            doc = None
+            shutil.copyfile(src, dst)          # byte-for-byte copy
+            return rep
+
+        if doc.is_encrypted:
+            rep["notes"].append("encryption removed from the copy")
+        doc.save(part, garbage=3, deflate=True,
+                 encryption=pymupdf.PDF_ENCRYPT_NONE)
+        doc.close()
+        doc = None
+
+        ok, reason = verify_output(src, part)
+        if not ok:
+            os.remove(part)
+            shutil.copyfile(src, dst)
+            rep.update(watermarks=0, image_logos=0, vector_logos=0, wordmarks=0)
+            rep["notes"].append(f"REVERTED: kept original unchanged - {reason}")
+            return rep
+
+        os.replace(part, dst)
+        rep["had_logo"] = True
+        return rep
+    except Exception as e:
+        rep["error"] = f"{type(e).__name__}: {e}"
+        return rep
+    finally:
+        try:
+            if doc is not None:
+                doc.close()
         except Exception:
             pass
-        return None, {"vector_logos": 0, "wordmarks": 0}
+        try:
+            if os.path.exists(part):
+                os.remove(part)
+        except Exception:
+            pass
 
 
-def process_pdf(path):
-    """Returns (writer or None, report dict). Never raises on bad files."""
-    rep = {"file": os.path.basename(path), "watermarks": 0, "logos": [], "error": None}
-    try:
-        reader = PdfReader(path)
-    except Exception as e:
-        rep["error"] = f"unreadable: {e}"
-        return None, rep
-
-    n_pages = len(reader.pages)
-    if n_pages == 0:
-        rep["error"] = "no pages"
-        return None, rep
-
-    # NOTE: all mutations happen on the reader's pages BEFORE they are handed
-    # to the writer -- PdfWriter snapshots page state at add_page() time.
-    pages = list(reader.pages)
-
-    # --- pass 1: watermark annotations + collect image placements ---
-    placements = []
-    for idx, page in enumerate(pages):
-        rep["watermarks"] += remove_watermark_annots(page)
-        w, h = page_size(page)
-        name_to_hash = image_name_to_hash(page)
-        resources = page.get("/Resources") or {}
-        for stream_obj in content_streams(page):
-            found = []
-            collect_placements(
-                stream_obj, reader, resources, name_to_hash, IDENTITY, found
-            )
-            for f in found:
-                f.update({"page_idx": idx, "page_w": w, "page_h": h})
-                placements.append(f)
-
-    # --- pass 2: decide which image hashes are logos ---
-    by_hash = defaultdict(list)
-    for pl in placements:
-        by_hash[pl["hash"]].append(pl)
-
-    logo_hashes = set()
-    for h, pls in by_hash.items():
-        page_idxs = {p["page_idx"] for p in pls}
-        w, hgt = pls[0]["page_w"], pls[0]["page_h"]
-        page_area = w * hgt
-        cxs = sorted((p["bbox"][0] + p["bbox"][2]) / 2 for p in pls)
-        cys = sorted((p["bbox"][1] + p["bbox"][3]) / 2 for p in pls)
-        cx_med, cy_med = cxs[len(cxs) // 2], cys[len(cys) // 2]
-        consistent = all(
-            abs((p["bbox"][0] + p["bbox"][2]) / 2 - cx_med) < 8
-            and abs((p["bbox"][1] + p["bbox"][3]) / 2 - cy_med) < 8
-            for p in pls
-        )
-        max_area = max(
-            (p["bbox"][2] - p["bbox"][0]) * (p["bbox"][3] - p["bbox"][1]) for p in pls
-        )
-        small = max_area < 0.12 * page_area
-        repeated = len(page_idxs) >= max(2, math.ceil(0.7 * n_pages))
-
-        single_page_band = False
-        if n_pages == 1:
-            in_band = cy_med > 0.85 * hgt or cy_med < 0.15 * hgt
-            single_page_band = in_band and max_area < 0.08 * page_area
-
-        if (repeated and consistent and small) or single_page_band:
-            logo_hashes.add(h)
-            rep["logos"].append(
-                {
-                    "pages": sorted(page_idxs),
-                    "band": "header/footer" if single_page_band else "repeated",
-                }
-            )
-
-    # --- pass 3: strip logo Do ops from page streams and form XObjects ---
-    if logo_hashes:
-        for page in pages:
-            name_to_hash = image_name_to_hash(page)
-            drop_names = {n for n, hh in name_to_hash.items() if hh in logo_hashes}
-            if not drop_names:
-                continue
-            contents = page.get("/Contents")
-            if isinstance(contents, ArrayObject):
-                for i, ref in enumerate(contents):
-                    s = ref.get_object()
-                    nd = strip_ops(s, reader, drop_names)
-                    if nd is not None:
-                        contents[i] = replace_stream_data(s, nd)
-            elif contents is not None:
-                s = contents.get_object()
-                nd = strip_ops(s, reader, drop_names)
-                if nd is not None:
-                    page[NameObject("/Contents")] = replace_stream_data(s, nd)
-            # forms nested in page resources
-            xobjs = (page.get("/Resources") or {}).get("/XObject") or {}
-            form_res_list = []
-            for xname in list(xobjs.keys()):
-                try:
-                    xo = xobjs[xname].get_object()
-                except Exception:
-                    continue
-                if xo.get("/Subtype") == "/Form":
-                    nd = strip_ops(xo, reader, drop_names)
-                    if nd is not None:
-                        xobjs[NameObject(xname)] = replace_stream_data(xo, nd)
-                        xo = xobjs[xname]
-                    form_res_list.append(xo.get("/Resources") or {})
-            # drop orphaned image XObject entries so the logos are truly gone
-            for res_dict in [(page.get("/Resources") or {})] + form_res_list:
-                xd = res_dict.get("/XObject")
-                if xd is None:
-                    continue
-                for k in [k for k in xd.keys() if norm_name(k) in drop_names]:
-                    del xd[k]
-
-    writer = PdfWriter()
-    for p in pages:
-        writer.add_page(p)
-
-    return writer, rep
-
-
-def had_logo(rep, pre):
-    """True if any logo/watermark was removed for this file."""
-    try:
-        return (
-            rep.get("watermarks", 0) > 0
-            or len(rep.get("logos", [])) > 0
-            or pre.get("vector_logos", 0) > 0
-            or pre.get("wordmarks", 0) > 0
-        )
-    except Exception:
-        return False
-
-
+# ------------------------------------------------------------- the batch ----
 def clean_pdfs(input_dir, out_dir=None, progress_callback=None, log_callback=None):
-    """Batch-clean PDFs. Importable engine for GUI and CLI.
+    """Batch-clean PDFs. Importable engine for the GUI and the CLI.
 
-    Args:
-        input_dir: folder containing PDFs
-        out_dir: output folder (default: <input_dir>/cleaned)
-        progress_callback: callable(current, total, filename) or None
-        log_callback: callable(message_str) or None
-
-    Returns:
-        dict with keys: done, skipped, out_dir, lines, details
-        details is a list of dicts: {fname, src, dst, had_logo, skipped, error}
+    progress_callback(current, total, filename) and log_callback(message)
+    are optional. Returns {done, skipped, out_dir, lines, details} where
+    details is a list of {fname, src, dst, had_logo, skipped, error}.
     """
     in_dir = os.path.abspath(input_dir)
+    if not os.path.isdir(in_dir):
+        raise FileNotFoundError(f"Folder not found: {in_dir}")
     out_dir = os.path.abspath(out_dir) if out_dir else os.path.join(in_dir, "cleaned")
+    if os.path.normcase(out_dir) == os.path.normcase(in_dir):
+        raise ValueError("Output folder must be different from the input folder "
+                         "(originals are never overwritten).")
     os.makedirs(out_dir, exist_ok=True)
 
     def _log(msg):
@@ -534,76 +357,154 @@ def clean_pdfs(input_dir, out_dir=None, progress_callback=None, log_callback=Non
             except Exception:
                 pass
 
-    pdfs = sorted(f for f in os.listdir(in_dir) if f.lower().endswith(".pdf"))
+    pdfs = sorted((f for f in os.listdir(in_dir)
+                   if f.lower().endswith(".pdf") and
+                   os.path.isfile(os.path.join(in_dir, f))), key=str.lower)
     total = len(pdfs)
     if not pdfs:
         _log(f"No PDFs found in {in_dir}")
         return {"done": 0, "skipped": 0, "out_dir": out_dir, "lines": [], "details": []}
 
-    lines = []
-    details = []
-    done, skipped = 0, 0
+    lines, details = [], []
+    done = skipped = 0
     for idx, fname in enumerate(pdfs, start=1):
         src = os.path.join(in_dir, fname)
+        dst = os.path.join(out_dir, fname)
         if progress_callback:
             try:
                 progress_callback(idx, total, fname)
             except Exception:
                 pass
         _log(f"[{idx}/{total}] {fname}")
-        # pre-pass: header logos (vector-drawn marks + text wordmarks)
-        tmp, pre = fitz_prepass(src)
-        use_src = tmp if tmp else src
-        writer, rep = process_pdf(use_src)
-        if tmp:
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
-        if writer is None:
+
+        rep = process_pdf(src, dst)
+        if rep["error"]:
             skipped += 1
             msg = f"{fname}: SKIPPED ({rep['error']})"
-            lines.append(msg)
-            _log(msg)
             details.append({"fname": fname, "src": src, "dst": None,
-                            "had_logo": False, "skipped": True, "error": rep.get("error")})
-            continue
-        dst = os.path.join(out_dir, fname)
-        with open(dst, "wb") as f:
-            writer.write(f)
-        done += 1
-        logo_found = had_logo(rep, pre)
-        bits = [f"watermarks={rep['watermarks']}", f"logos={len(rep['logos'])}",
-                f"vector_logos={pre['vector_logos']}",
-                f"wordmarks={pre['wordmarks']}"]
-        for lg in rep["logos"]:
-            bits.append(f"logo on pages {lg['pages']} ({lg['band']})")
-        msg = f"{fname}: " + ", ".join(bits)
+                            "had_logo": False, "skipped": True, "error": rep["error"]})
+        else:
+            done += 1
+            msg = (f"{fname}: watermarks={rep['watermarks']}, "
+                   f"image_logos={rep['image_logos']}, "
+                   f"vector_logos={rep['vector_logos']}, wordmarks={rep['wordmarks']}")
+            if rep["notes"]:
+                msg += " | " + "; ".join(rep["notes"])
+            details.append({"fname": fname, "src": src, "dst": dst,
+                            "had_logo": rep["had_logo"], "skipped": False, "error": None})
         lines.append(msg)
         _log(msg)
-        details.append({"fname": fname, "src": src, "dst": dst,
-                        "had_logo": logo_found, "skipped": False, "error": None})
 
-    report = "\n".join(lines)
-    summary = f"\n{done} cleaned -> {out_dir} | {skipped} skipped"
-    _log(summary.strip())
-    with open(os.path.join(out_dir, "report.txt"), "w", encoding="utf-8") as f:
-        f.write(report + f"\n\n{done} cleaned -> {out_dir} | {skipped} skipped\n")
-
+    summary = f"{done} cleaned -> {out_dir} | {skipped} skipped"
+    _log(summary)
+    try:
+        with open(os.path.join(out_dir, "report.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + f"\n\n{summary}\n")
+    except Exception as e:
+        _log(f"Could not write report.txt: {e}")
     return {"done": done, "skipped": skipped, "out_dir": out_dir,
             "lines": lines, "details": details}
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Batch-remove logos/watermarks from PDFs.")
-    ap.add_argument("input_dir", help="folder containing the PDFs")
-    ap.add_argument("--out", default=None, help="output folder (default: <input>/cleaned)")
-    args = ap.parse_args()
+# ------------------------------------------------------------- selftest ----
+def _logo_like(page, cx=298.0, cy=50.0):
+    """Draw a Juicebox-like vector mark (icon + wordmark blobs) centered at cx."""
+    s = page.new_shape()
+    s.draw_circle(pymupdf.Point(cx - 44, cy), 8)
+    s.finish(fill=(0, 0, 0), color=None)
+    for i in range(7):
+        s.draw_rect(pymupdf.Rect(cx - 28 + i * 11, cy - 6, cx - 21 + i * 11, cy + 6))
+        s.finish(fill=(0, 0, 0), color=None)
+    s.commit()
 
-    result = clean_pdfs(args.input_dir, args.out,
-                        log_callback=print)
-    print(f"\n{result['done']} cleaned -> {result['out_dir']} | {result['skipped']} skipped")
-    return 0
+
+def _ink(page, clip):
+    pix = page.get_pixmap(dpi=72, clip=clip, alpha=False)
+    return sum(1 for b in pix.samples if b < 250)
+
+
+def make_sample_resume(path, name="Selftest Person", banner=False, pages=1):
+    """Synthetic Juicebox-style export used by the self-test and unit tests."""
+    d = pymupdf.open()
+    for i in range(pages):
+        p = d.new_page(width=595, height=842)
+        if i == 0:
+            if banner:
+                p.draw_rect(pymupdf.Rect(200, 40, 400, 90), color=(.1, .3, .6),
+                            fill=(.1, .3, .6))
+                p.insert_text((232, 72), "BANNER NAME", fontsize=18, color=(1, 1, 1))
+            else:
+                _logo_like(p)
+            p.draw_line(pymupdf.Point(48, 82), pymupdf.Point(547, 82),
+                        color=(.8, .8, .8), width=1)
+            p.insert_text((48, 150), name, fontsize=26)
+            p.insert_text((48, 180), "Sales Associate at Example Store", fontsize=11)
+        else:
+            for k in range(5):  # centered dots near the top of page 2
+                p.draw_circle(pymupdf.Point(270 + k * 14, 60), 4, fill=(0, 0, 0))
+            p.insert_text((48, 150), "Page two body text", fontsize=12)
+    d.save(path)
+    d.close()
+
+
+def selftest():
+    """End-to-end check of the engine. Returns (ok, message)."""
+    tmp = tempfile.mkdtemp(prefix="logoremover_selftest_")
+    try:
+        in_dir = os.path.join(tmp, "in")
+        os.makedirs(in_dir)
+        make_sample_resume(os.path.join(in_dir, "logo.pdf"), pages=2)
+        make_sample_resume(os.path.join(in_dir, "banner.pdf"), name="Banner Person",
+                           banner=True)
+        res = clean_pdfs(in_dir)
+        if res["done"] != 2 or res["skipped"]:
+            return False, f"expected 2 cleaned/0 skipped, got {res['done']}/{res['skipped']}"
+
+        logo_box = pymupdf.Rect(230, 35, 370, 65)
+        rule_box = pymupdf.Rect(60, 78, 540, 86)
+        with pymupdf.open(os.path.join(in_dir, "logo.pdf")) as a, \
+                pymupdf.open(os.path.join(res["out_dir"], "logo.pdf")) as b:
+            if _ink(a[0], logo_box) == 0:
+                return False, "test fixture is broken (no logo drawn)"
+            if _ink(b[0], logo_box) != 0:
+                return False, "logo was NOT removed"
+            if _ink(b[0], rule_box) != _ink(a[0], rule_box):
+                return False, "divider line was damaged"
+            if _ink(b[1], pymupdf.Rect(250, 50, 350, 70)) != \
+                    _ink(a[1], pymupdf.Rect(250, 50, 350, 70)):
+                return False, "page 2 content was altered"
+            if a[0].get_text() != b[0].get_text() or a[1].get_text() != b[1].get_text():
+                return False, "text changed"
+        banner_box = pymupdf.Rect(190, 30, 410, 100)
+        with pymupdf.open(os.path.join(in_dir, "banner.pdf")) as a, \
+                pymupdf.open(os.path.join(res["out_dir"], "banner.pdf")) as b:
+            if "BANNER NAME" not in b[0].get_text():
+                return False, "name banner text was destroyed"
+            if _ink(a[0], banner_box) != _ink(b[0], banner_box):
+                return False, "name banner was painted over"
+        return True, f"engine OK (v{__version__}, PyMuPDF {pymupdf.__version__})"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------------- CLI ----
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Batch-remove Juicebox logos/watermarks from PDFs.")
+    ap.add_argument("input_dir", nargs="?", help="folder containing the PDFs")
+    ap.add_argument("--out", default=None, help="output folder (default: <input>/cleaned)")
+    ap.add_argument("--selftest", action="store_true", help="run the built-in self-test and exit")
+    args = ap.parse_args(argv)
+
+    if args.selftest:
+        ok, msg = selftest()
+        print(("PASS: " if ok else "FAIL: ") + msg)
+        return 0 if ok else 1
+    if not args.input_dir:
+        ap.error("input_dir is required (or use --selftest)")
+    result = clean_pdfs(args.input_dir, args.out, log_callback=print)
+    return 0 if result["skipped"] == 0 else 2
 
 
 if __name__ == "__main__":
