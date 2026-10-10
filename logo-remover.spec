@@ -4,7 +4,7 @@ PyInstaller spec for LogoRemover desktop app.
 
 - Windowed (no console)
 - One-dir build (COLLECT), app name LogoRemover
-- macOS: target_arch='universal2' (Intel + Apple Silicon)
+- macOS: native arch (Apple Silicon on macos-latest runners)
 - Entry point: app.py (which imports remove_logos.py engine)
 
 Build locally:
@@ -45,7 +45,7 @@ exe = EXE(
     console=False,  # windowed: no console window
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch='universal2',  # macOS universal2; ignored on Windows
+    target_arch=None,  # native arch (universal2 needs a universal2 Python build; None = what the runner has)
     codesign_identity=None,
     entitlements_file=None,
 )
