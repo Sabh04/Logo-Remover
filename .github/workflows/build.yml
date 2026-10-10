@@ -1,0 +1,65 @@
+name: Build LogoRemover
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller logo-remover.spec
+
+      - name: Zip Windows build
+        run: Compress-Archive -Path dist/LogoRemover/* -DestinationPath LogoRemover-windows.zip
+        shell: pwsh
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LogoRemover-windows
+          path: LogoRemover-windows.zip
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install -r requirements.txt pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller logo-remover.spec
+
+      - name: Create DMG
+        run: |
+          hdiutil create -volname LogoRemover -srcfolder dist/LogoRemover.app -ov -format UDZO LogoRemover.dmg
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LogoRemover-mac
+          path: LogoRemover.dmg
